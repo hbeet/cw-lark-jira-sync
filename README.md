@@ -17,6 +17,7 @@ Keep source, runtime data, and private config separate. Do not share `.env`, Jir
 npm run check
 npm test
 npm run deploy
+npm run doctor
 npm run health
 npm run refresh:all
 npm run refresh:spot
@@ -24,3 +25,7 @@ npm run refresh:ui
 ```
 
 Use `npm run deploy` after changing source code. It syncs source into the runtime directory and restarts the LaunchAgent service.
+
+Run `npm run doctor` to produce a redacted diagnostic report.
+
+Default refresh targets are configured in `config/tables.json`.

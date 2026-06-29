@@ -1,29 +1,16 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadEnvFile } from "../lib/env-file.mjs";
+import { loadTableConfig, resolveTableTargets } from "../lib/table-config.mjs";
 
 const sourceDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const envFile = process.env.JIRA_LARK_ENV_FILE || `${process.env.HOME}/.config/jira-lark-sync/env`;
+const tableConfigPath = process.env.JIRA_LARK_TABLE_CONFIG || "config/tables.json";
 const mode = process.argv[2] || "all";
-
-const baseToken = "GpJLbIuPWaT5wFs8eVhjvYCRpdH";
-const tableConfigs = {
-  spot: {
-    name: "现货总表",
-    baseToken,
-    tableId: "tblXAEpyR8CBg4r2",
-    viewId: "vewm4Z6sMK",
-  },
-  ui: {
-    name: "迭代产品UI规划",
-    baseToken,
-    tableId: "tblzzkHyrY7TaGE0",
-    viewId: "vewxCTMkfC",
-  },
-};
 
 const syncFields = new Set([
   "jira号",
@@ -44,24 +31,6 @@ const syncFields = new Set([
   "开发预估工期",
   "延期状态",
 ]);
-
-function loadEnv(path) {
-  const env = {};
-  const text = readFileSync(path, "utf8");
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-    if (!match) continue;
-    const [, key, rawValue] = match;
-    let value = rawValue.trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    env[key] = value;
-  }
-  return env;
-}
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -97,7 +66,7 @@ function listViewJiraRecords(config) {
       "--base-token", config.baseToken,
       "--table-id", config.tableId,
       "--view-id", config.viewId,
-      "--field-id", "jira号",
+      "--field-id", config.jiraField || "jira号",
       "--offset", String(offset),
       "--limit", "200",
       "--format", "json",
@@ -147,7 +116,7 @@ async function refreshTable(config, env) {
         LARK_TARGET_RECORD_MAP_FILE: mapFile,
         LARK_FIELD_MAPPING_JSON: JSON.stringify(fieldMapping(config)),
         LARK_FIELD_MAPPING_STRICT: "1",
-        LARK_JIRA_FIELD_NAME: "jira号",
+        LARK_JIRA_FIELD_NAME: config.jiraField || "jira号",
         JIRA_JQL: `key in (${uniqueKeys.join(",")})`,
         JIRA_MAX: String(uniqueKeys.length),
         JIRA_PAGE_SIZE: "50",
@@ -159,14 +128,6 @@ async function refreshTable(config, env) {
   }
 }
 
-const selected = mode === "all" ? ["spot", "ui"] : [mode];
-for (const key of selected) {
-  if (!tableConfigs[key]) {
-    console.error(`unknown refresh target: ${key}`);
-    console.error(`available targets: all, ${Object.keys(tableConfigs).join(", ")}`);
-    process.exit(1);
-  }
-}
-
-const env = loadEnv(envFile);
-for (const key of selected) await refreshTable(tableConfigs[key], env);
+const env = loadEnvFile(envFile);
+const tableConfig = loadTableConfig(tableConfigPath, sourceDir);
+for (const config of resolveTableTargets(tableConfig, mode)) await refreshTable(config, env);

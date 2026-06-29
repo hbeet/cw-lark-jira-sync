@@ -80,6 +80,7 @@ rsync([
   "package.json",
   "README.md",
   ".env.example",
+  "config",
   "lark_user_map.tsv",
   "jira_lark_fields.json",
   "lib",

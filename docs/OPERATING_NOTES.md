@@ -19,11 +19,15 @@ Common local commands:
 
 ```bash
 npm run health
+npm run doctor
 npm run refresh:all
 npm run refresh:spot
 npm run refresh:ui
 npm run rotate:jira-token
+npm run setup
 ```
+
+Default refresh targets live in `config/tables.json`. Add future business tables there instead of editing refresh script code.
 
 ## Default Full Refresh Scope
 

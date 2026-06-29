@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /Users/bin/Documents/Codex/2026-06-15/jira-api-key
+cd "$(cd "$(dirname "$0")" && pwd)"
 set -a
 source /Users/bin/.config/jira-lark-sync/env
 set +a

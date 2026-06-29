@@ -1,0 +1,19 @@
+{
+  "defaultTargets": ["spot", "ui"],
+  "tables": {
+    "spot": {
+      "name": "现货总表",
+      "baseToken": "GpJLbIuPWaT5wFs8eVhjvYCRpdH",
+      "tableId": "tblXAEpyR8CBg4r2",
+      "viewId": "vewm4Z6sMK",
+      "jiraField": "jira号"
+    },
+    "ui": {
+      "name": "迭代产品UI规划",
+      "baseToken": "GpJLbIuPWaT5wFs8eVhjvYCRpdH",
+      "tableId": "tblzzkHyrY7TaGE0",
+      "viewId": "vewxCTMkfC",
+      "jiraField": "jira号"
+    }
+  }
+}

@@ -15,7 +15,7 @@
 进入同步服务目录：
 
 ```bash
-cd /Users/bin/Documents/Codex/2026-06-15/jira-api-key
+cd /Users/bin/Projects/jira-lark-sync
 ```
 
 运行向导：

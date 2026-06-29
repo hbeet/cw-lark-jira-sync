@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { configureDb, dbAll, dbExec, dbRun } from "./lib/db.mjs";
@@ -64,11 +65,20 @@ if (process.env.LARK_SYNC_DB_PATH) {
   try {
     dbExec("ALTER TABLE jira_changelog_cache ADD COLUMN status_entered_json TEXT;");
   } catch (error) {
-    // Expected if column already exists
     if (!/duplicate column/i.test(error.message)) {
       console.error("[schema migration] unexpected error:", error.message);
     }
   }
+  dbExec(`
+    CREATE TABLE IF NOT EXISTS sync_write_cache (
+      table_id TEXT NOT NULL,
+      record_id TEXT NOT NULL,
+      fields_hash TEXT NOT NULL,
+      jira_updated TEXT,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(table_id, record_id)
+    );
+  `);
 }
 
 function jiraHeaders() {
@@ -370,16 +380,29 @@ function jiraUser(value) {
   return String(value);
 }
 
+function needsChangelog(latestAcceptance) {
+  return Boolean(latestAcceptance) || statusTimelineFieldNames().length > 0;
+}
+
 async function buildRecord(issue, userMap, devEstimates, recordMap) {
   const key = issue.key;
   const fields = issue.fields || {};
   const latestAcceptance = parseJiraDate(fields.customfield_12203);
-  const changelogData = await changelogDataForIssue(
-    key,
-    latestAcceptance.split(" ")[0] || "",
-    fields.updated || "",
-  );
-  const originalAcceptance = parseJiraDate(changelogData.originalAcceptance);
+
+  let originalAcceptance = latestAcceptance;
+  let statusEntered = {};
+  if (needsChangelog(latestAcceptance)) {
+    const changelogData = await changelogDataForIssue(
+      key,
+      latestAcceptance.split(" ")[0] || "",
+      fields.updated || "",
+    );
+    originalAcceptance = parseJiraDate(changelogData.originalAcceptance);
+    statusEntered = changelogData.statusEntered;
+  } else {
+    console.error(`changelog_skipped ${key} (no acceptance time, no timeline fields)`);
+  }
+
   const productOwner = jiraUser(fields.customfield_11401);
   const projectManager = jiraUser(fields.customfield_12200);
   const sprint = latestSprintName(fields.customfield_10100);
@@ -405,7 +428,7 @@ async function buildRecord(issue, userMap, devEstimates, recordMap) {
   };
   for (const fieldName of statusTimelineFieldNames()) {
     const statusName = statusNameFromTimelineField(fieldName);
-    payload[fieldName] = changelogData.statusEntered[statusName] || "";
+    payload[fieldName] = statusEntered[statusName] || "";
   }
   if (!preserveExistingSprint) payload["迭代"] = sprint;
 
@@ -417,48 +440,46 @@ async function buildRecord(issue, userMap, devEstimates, recordMap) {
   }));
 }
 
-function currentRecords(recordIds, fields) {
-  if (recordIds.length === 0 || fields.length === 0) return new Map();
-  const args = [
-    "base", "+record-get",
-    "--as", larkAs,
-    "--base-token", larkBaseToken,
-    "--table-id", larkTableId,
-    "--format", "json",
-  ];
-  for (const id of recordIds) args.push("--record-id", id);
-  for (const field of fields) args.push("--field-id", field);
-  const response = larkCliJson(args, { timeout: 60000 });
-  const ids = response?.data?.record_id_list || [];
-  const rows = response?.data?.data || [];
-  const fieldNames = response?.data?.fields || [];
-  const byId = new Map();
-  for (let i = 0; i < ids.length; i += 1) {
-    const values = {};
-    for (let j = 0; j < fieldNames.length; j += 1) values[fieldNames[j]] = rows[i]?.[j];
-    byId.set(ids[i], values);
+function fieldsHash(fields) {
+  const normalized = {};
+  for (const [key, value] of Object.entries(fields)) {
+    normalized[key] = normalizeForCompare(key, value);
   }
-  return byId;
+  return createHash("sha256").update(JSON.stringify(normalized, Object.keys(normalized).sort())).digest("hex").slice(0, 16);
+}
+
+function getCachedHash(tableId, recordId) {
+  if (!process.env.LARK_SYNC_DB_PATH) return null;
+  const row = dbAll("SELECT fields_hash FROM sync_write_cache WHERE table_id=? AND record_id=? LIMIT 1;", [tableId, recordId])[0];
+  return row?.fields_hash || null;
+}
+
+function saveCachedHash(tableId, recordId, hash, jiraUpdated) {
+  if (!process.env.LARK_SYNC_DB_PATH) return;
+  const now = new Date().toISOString();
+  dbRun(`
+    INSERT INTO sync_write_cache (table_id, record_id, fields_hash, jira_updated, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(table_id, record_id) DO UPDATE SET
+      fields_hash=excluded.fields_hash,
+      jira_updated=excluded.jira_updated,
+      updated_at=excluded.updated_at;
+  `, [tableId, recordId, hash, jiraUpdated || "", now]);
 }
 
 function filterChanged(records) {
   if (!diffWrite) return records;
-  const existing = records.filter((record) => record.record_id);
-  if (existing.length === 0) return records;
-  const fields = [...new Set(existing.flatMap((record) => Object.keys(record.fields)))];
-  const current = currentRecords(existing.map((record) => record.record_id), fields);
   let skipped = 0;
   const changed = records.filter((record) => {
     if (!record.record_id) return true;
-    const actual = current.get(record.record_id);
-    if (!actual) return true;
-    const isSame = Object.entries(record.fields).every(([field, desired]) => {
-      const left = normalizeForCompare(field, desired);
-      const right = normalizeForCompare(field, actual[field]);
-      return JSON.stringify(left) === JSON.stringify(right);
-    });
-    if (isSame) skipped += 1;
-    return !isSame;
+    const hash = fieldsHash(record.fields);
+    record._fieldsHash = hash;
+    const cached = getCachedHash(larkTableId, record.record_id);
+    if (cached && cached === hash) {
+      skipped += 1;
+      return false;
+    }
+    return true;
   });
   console.error(`diff_write skipped=${skipped} changed=${changed.length}`);
   return changed;
@@ -503,7 +524,8 @@ function upsertRecord(record) {
 }
 
 function batchUpdate(records) {
-  const updateRecords = filterChanged(records.filter((record) => record.record_id)).map(normalizeBatchRecord);
+  const changedRecords = filterChanged(records.filter((record) => record.record_id));
+  const updateRecords = changedRecords.map(normalizeBatchRecord);
   const createRecords = records.filter((record) => !record.record_id);
   if (createMissingRecords) {
     for (const record of createRecords) upsertRecord(record);
@@ -540,6 +562,11 @@ function batchUpdate(records) {
     if (result.stderr) console.error(result.stderr.slice(0, 2000));
     for (const record of updateRecords.slice(i, i + batchChunkSize)) upsertRecord(record);
   }
+  for (const record of changedRecords) {
+    if (record._fieldsHash && record.record_id) {
+      saveCachedHash(larkTableId, record.record_id, record._fieldsHash, record.jira_updated || "");
+    }
+  }
   console.error(`batch_updated ${updateRecords.length} records in ${chunks} chunks`);
 }
 
@@ -548,11 +575,12 @@ async function main() {
   const userMap = loadUserMap();
   const recordMap = loadTargetRecordMap();
   const batchRecords = [];
-  let startAt = 0;
-  let synced = 0;
 
-  while (synced < jiraMax) {
-    const maxResults = Math.min(jiraPageSize, jiraMax - synced);
+  // Phase 1: fetch all issues
+  const allIssues = [];
+  let startAt = 0;
+  while (allIssues.length < jiraMax) {
+    const maxResults = Math.min(jiraPageSize, jiraMax - allIssues.length);
     const page = await jiraGet("/search", {
       jql: jiraJql,
       startAt,
@@ -561,26 +589,36 @@ async function main() {
     });
     const issues = page.issues || [];
     if (issues.length === 0) break;
-    const devEstimates = await preloadDevEstimates([...new Set(issues.map((issue) => issue.key))]);
-    for (const issue of issues) {
-      const records = await buildRecord(issue, userMap, devEstimates, recordMap);
-      if (nativeBatchUpdate) {
-        batchRecords.push(...records);
-        console.log(`queued ${issue.key} records=${records.length}`);
-      } else {
-        for (const record of records) {
-          upsertRecord(record);
-          console.log(`${record.record_id ? "updated" : "created"} ${record.jira_key}`);
-        }
-      }
-    }
-    synced += issues.length;
+    allIssues.push(...issues);
     startAt += issues.length;
     if (startAt >= Number(page.total || 0)) break;
   }
 
+  if (allIssues.length === 0) {
+    console.log("done, 0 Jira issues found");
+    return;
+  }
+
+  // Phase 2: preload dev estimates once for all issues
+  const devEstimates = await preloadDevEstimates([...new Set(allIssues.map((issue) => issue.key))]);
+
+  // Phase 3: build records and batch write
+  for (const issue of allIssues) {
+    const records = await buildRecord(issue, userMap, devEstimates, recordMap);
+    if (nativeBatchUpdate) {
+      batchRecords.push(...records);
+      console.log(`queued ${issue.key} records=${records.length}`);
+    } else {
+      for (const record of records) {
+        upsertRecord(record);
+        if (record.record_id) saveCachedHash(larkTableId, record.record_id, fieldsHash(record.fields), "");
+        console.log(`${record.record_id ? "updated" : "created"} ${record.jira_key}`);
+      }
+    }
+  }
+
   if (nativeBatchUpdate) batchUpdate(batchRecords);
-  console.log(`done, processed ${synced} Jira issues`);
+  console.log(`done, processed ${allIssues.length} Jira issues`);
 }
 
 main().catch((error) => {

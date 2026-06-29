@@ -9,7 +9,6 @@ import {
   indexedJiraKeys, indexedRecordsForTable, clearIndexCache,
   indexRecordCount, indexJiraKeyCount, migrateJsonCacheToDb, rebuildIndexFromLark,
 } from "./lib/index-cache.mjs";
-import { chunkArray } from "./lib/incremental.mjs";
 import { checkJiraReachable as checkJiraReachableApi, jiraSearchAll as jiraSearchAllApi } from "./lib/jira-client.mjs";
 import { extractJiraKey } from "./lib/sync-utils.mjs";
 import { checkLarkReachable as checkLarkReachableApi, discoverSyncTableConfigs as discoverSyncTableConfigsApi } from "./lib/lark-base-sync.mjs";
@@ -40,6 +39,7 @@ const eventMasterKeyFile = config.event.masterKeyFile;
 const incrementalEnabled = config.incremental.enabled;
 const incrementalIntervalMs = config.incremental.intervalMs;
 const incrementalWindow = config.incremental.window;
+const incrementalProject = config.incremental.project;
 const incrementalRetryWhenUnreachableMs = config.incremental.retryWhenUnreachableMs;
 const jiraReachabilityCheckEnabled = config.jira.reachabilityCheckEnabled;
 const jiraReachabilityTimeoutMs = config.jira.reachabilityTimeoutMs;
@@ -159,8 +159,16 @@ function initDb() {
 }
 
 
-function doRebuildIndex() {
-  return rebuildIndexFromLark({ env: process.env, cwd: __dirname, loadSyncTableConfigs });
+const REBUILD_COOLDOWN_MS = 10 * 60 * 1000;
+let lastRebuildAt = 0;
+
+function doRebuildIndex({ force = false } = {}) {
+  if (!force && lastRebuildAt && Date.now() - lastRebuildAt < REBUILD_COOLDOWN_MS) {
+    return { ok: true, skipped: true, reason: "cooldown", last_rebuild_seconds_ago: Math.round((Date.now() - lastRebuildAt) / 1000) };
+  }
+  const result = rebuildIndexFromLark({ env: process.env, cwd: __dirname, loadSyncTableConfigs });
+  lastRebuildAt = Date.now();
+  return result;
 }
 
 function rotateLogs() {
@@ -967,31 +975,27 @@ async function runIncrementalRefresh(options = {}) {
       return;
     }
 
-    const keysInLark = indexedJiraKeys();
+    const keysInLark = new Set(indexedJiraKeys());
+    const project = incrementalProject || [...keysInLark].find(Boolean)?.split("-")[0] || "CW";
+    const jql = `project = ${project} AND updated >= ${incrementalWindow} order by updated desc`;
+    const issues = await jiraSearchAll(jql, { fields: "updated", pageSize: 100, max: 500 });
 
-    for (const keys of chunkArray(keysInLark, 80)) {
-      if (keys.length === 0) continue;
-      const issues = await jiraSearchAll(`key in (${keys.join(",")}) AND updated >= ${incrementalWindow} order by updated desc`, {
-        fields: "updated",
-        pageSize: 100,
-        max: keys.length,
-      });
-      for (const issue of issues) {
-        for (const record of cachedRecordsForJira(issue.key)) {
-          if (record.jira_updated && issue.fields?.updated && record.jira_updated === issue.fields.updated) {
-            skippedFresh.push({ jira_key: issue.key, table_id: record.table_id, record_id: record.record_id });
-            continue;
-          }
-          const result = enqueueRecordSync({
-            source: "jira_incremental_existing_lark_rows",
-            tableId: record.table_id,
-            recordId: record.record_id,
-            jiraKey: issue.key,
-            inDefaultScope: record.in_default_scope ?? null,
-            jiraUpdated: issue.fields?.updated || "",
-          });
-          queued.push({ jira_key: issue.key, table_id: record.table_id, record_id: record.record_id, result });
+    for (const issue of issues) {
+      if (!keysInLark.has(issue.key)) continue;
+      for (const record of cachedRecordsForJira(issue.key)) {
+        if (record.jira_updated && issue.fields?.updated && record.jira_updated === issue.fields.updated) {
+          skippedFresh.push({ jira_key: issue.key, table_id: record.table_id, record_id: record.record_id });
+          continue;
         }
+        const result = enqueueRecordSync({
+          source: "jira_incremental_existing_lark_rows",
+          tableId: record.table_id,
+          recordId: record.record_id,
+          jiraKey: issue.key,
+          inDefaultScope: record.in_default_scope ?? null,
+          jiraUpdated: issue.fields?.updated || "",
+        });
+        queued.push({ jira_key: issue.key, table_id: record.table_id, record_id: record.record_id, result });
       }
     }
 
@@ -1001,7 +1005,8 @@ async function runIncrementalRefresh(options = {}) {
       finished_at: new Date().toISOString(),
       interval_seconds: incrementalIntervalMs / 1000,
       window: incrementalWindow,
-      lark_key_count: keysInLark.length,
+      jira_updated_count: issues.length,
+      lark_key_count: keysInLark.size,
       queued: queued.length,
       skipped_fresh: skippedFresh.length,
       jira_reachability: lastJiraReachability,
@@ -1309,7 +1314,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname === "/api/rebuild-index") {
-      const result = doRebuildIndex();
+      const result = doRebuildIndex({ force: true });
       sendJson(res, 200, result);
       return;
     }

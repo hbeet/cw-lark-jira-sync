@@ -1,51 +1,37 @@
 # Jira-Lark Sync MCP Server
 
-让 AI 助手（Claude Desktop / Cowork）直接操作你的 Jira 和 Lark 多维表格。
+让 Claude 直接操作你的 Jira 和 Lark 多维表格。
 
-## 前置条件
+## 快速开始
 
-1. 本项目已配好并运行中（`npm run health` 通过）
-2. `lark-cli` 已安装且在 PATH 中
-3. 私有配置已就位：`~/.config/jira-lark-sync/env`
-
-## 接入方法
-
-### Claude Desktop
-
-编辑 `~/Library/Application Support/Claude/claude_desktop_config.json`：
-
-```json
-{
-  "mcpServers": {
-    "jira-lark-sync": {
-      "command": "node",
-      "args": ["/path/to/jira-lark-sync/mcp/server.mjs"],
-      "env": {
-        "JIRA_LARK_ENV_FILE": "/path/to/.config/jira-lark-sync/env"
-      }
-    }
-  }
-}
+```bash
+git clone <repo> ~/Projects/jira-lark-sync
+cd ~/Projects/jira-lark-sync
+node scripts/setup.mjs
 ```
 
-### Cowork
+setup wizard 会引导你完成所有配置（约 3 分钟）：
+1. 检查 Node.js 和 lark-cli
+2. lark-cli 扫码登录
+3. 配置 Jira Token（自动打开浏览器）
+4. 粘贴飞书表格链接
+5. 自动部署服务 + 生成 MCP 配置
 
-在 Cowork 设置中添加 MCP server，command 填：
+## 验证
 
-```
-node /path/to/jira-lark-sync/mcp/server.mjs
-```
-
-环境变量 `JIRA_LARK_ENV_FILE` 指向你的私有配置文件。
+setup 完成后在 Claude 中试试：
+- "检查 Jira 连通性"
+- "列出 Lark 表"
+- "查看同步服务状态"
 
 ## 提供的工具（20 个）
 
-### 同步操作（9 个）
+### 同步操作
 
 | 工具 | 说明 |
 |------|------|
 | `sync_health` | 查看同步服务状态 |
-| `sync_jobs` | 查看任务列表（可按状态筛选） |
+| `sync_jobs` | 查看任务列表 |
 | `sync_errors` | 查看错误详情 |
 | `sync_record` | 同步单个 Jira issue |
 | `sync_refresh_all` | 全表刷新 |
@@ -54,15 +40,15 @@ node /path/to/jira-lark-sync/mcp/server.mjs
 | `sync_incremental` | 触发增量刷新 |
 | `sync_rebuild_index` | 重建索引 |
 
-### Jira 查询（3 个）
+### Jira 查询
 
 | 工具 | 说明 |
 |------|------|
 | `jira_check` | 检查 Jira 可达性 |
-| `jira_get_issue` | 查询单个 issue 详情 |
+| `jira_get_issue` | 查询 issue 详情 |
 | `jira_search` | JQL 搜索 |
 
-### Lark 表操作（8 个）
+### Lark 表操作
 
 | 工具 | 说明 |
 |------|------|
@@ -75,36 +61,30 @@ node /path/to/jira-lark-sync/mcp/server.mjs
 | `lark_create_record` | 新建记录 |
 | `lark_delete_record` | 删除记录 |
 
-## 分享给别人
-
-别人使用只需要：
-
-1. 克隆本项目
-2. 安装 `lark-cli`
-3. 创建自己的 `~/.config/jira-lark-sync/env`（参考 `.env.example`）
-4. 确保同步服务跑起来（`npm run setup && npm run deploy`）
-5. 在 Claude Desktop / Cowork 中配置 MCP server 指向 `mcp/server.mjs`
-
-## 私有配置模板
-
-`env` 文件至少需要：
-
-```
-JIRA_BASE_URL=https://your-jira.example.com
-JIRA_TOKEN=your-jira-pat
-LARK_BASE_TOKEN=your-lark-base-token
-LARK_TABLE_ID=default-table-id
-LARK_APP_ID=your-app-id
-LARK_SYNC_DB_PATH=/path/to/sync.db
-```
-
-## 开发
+## 日常维护
 
 ```bash
-# 语法检查
-cd mcp && npm run check
+# 检查服务
+curl -s http://127.0.0.1:8787/health | jq .ok
 
-# 手动测试（发送 JSON-RPC）
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
-{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | node server.mjs
+# 查看日志
+tail -f ~/.local/share/jira-lark-sync/logs/launchd-sync-server.err.log
+
+# 更换 Jira Token（过期时）
+node scripts/rotate-jira-token.mjs
+
+# 全面诊断
+node scripts/doctor.mjs
+
+# 更新代码后重新部署
+git pull && node scripts/deploy-local.mjs
 ```
+
+## 常见问题
+
+| 问题 | 解决 |
+|------|------|
+| sync_* 工具报 connection refused | 服务未启动：`launchctl kickstart gui/$(id -u)/com.legend.jira-lark-sync` |
+| Jira 401 | Token 过期，运行 `node scripts/rotate-jira-token.mjs` |
+| Lark 无数据 | 确认已被邀请到对应 Base |
+| VPN 相关 | Jira 需要公司网络/VPN |

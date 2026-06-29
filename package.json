@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check sync-server.mjs && node --check sync-runner.mjs && node --check lib/config.mjs && node --check lib/db.mjs && node --check lib/diagnostics.mjs && node --check lib/env-file.mjs && node --check lib/field-registry.mjs && node --check lib/incremental.mjs && node --check lib/index-cache.mjs && node --check lib/jira-client.mjs && node --check lib/job-queue.mjs && node --check lib/lark-base-sync.mjs && node --check lib/lark-cli.mjs && node --check lib/sync-utils.mjs && node --check lib/table-config.mjs && node --check scripts/rotate-jira-token.mjs && node --check scripts/deploy-local.mjs && node --check scripts/doctor.mjs && node --check scripts/health.mjs && node --check scripts/refresh-lark-tables.mjs && node --check scripts/setup.mjs",
+    "check": "node --check sync-server.mjs && node --check sync-runner.mjs && node --check lib/cli-utils.mjs && node --check lib/config.mjs && node --check lib/db.mjs && node --check lib/diagnostics.mjs && node --check lib/env-file.mjs && node --check lib/field-registry.mjs && node --check lib/incremental.mjs && node --check lib/index-cache.mjs && node --check lib/jira-client.mjs && node --check lib/job-queue.mjs && node --check lib/lark-base-sync.mjs && node --check lib/lark-cli.mjs && node --check lib/sync-utils.mjs && node --check lib/table-config.mjs && node --check scripts/rotate-jira-token.mjs && node --check scripts/deploy-local.mjs && node --check scripts/doctor.mjs && node --check scripts/health.mjs && node --check scripts/refresh-lark-tables.mjs && node --check scripts/setup.mjs",
     "deploy": "node scripts/deploy-local.mjs",
     "doctor": "node scripts/doctor.mjs",
     "health": "node scripts/health.mjs",

@@ -1,0 +1,173 @@
+[
+  {
+    "name": "jira号",
+    "type": "text",
+    "style": {
+      "type": "url"
+    }
+  },
+  {
+    "name": "概要",
+    "type": "text"
+  },
+  {
+    "name": "迭代",
+    "type": "select",
+    "multiple": false,
+    "options": [
+      {
+        "name": "Sprint 12D 0622~0703"
+      },
+      {
+        "name": "Sprint 11D 0608~0619"
+      }
+    ]
+  },
+  {
+    "name": "状态",
+    "type": "select",
+    "multiple": false,
+    "options": [
+      {
+        "name": "UI 设计中"
+      },
+      {
+        "name": "UI待办"
+      },
+      {
+        "name": "开发中"
+      },
+      {
+        "name": "需求待评审"
+      },
+      {
+        "name": "需求评审完成"
+      },
+      {
+        "name": "需求预评审完成"
+      },
+      {
+        "name": "需求验收中"
+      },
+      {
+        "name": "测试中"
+      },
+      {
+        "name": "关闭"
+      }
+    ]
+  },
+  {
+    "name": "优先级",
+    "type": "select",
+    "multiple": false,
+    "options": [
+      {
+        "name": "P0"
+      },
+      {
+        "name": "P1"
+      },
+      {
+        "name": "P2"
+      }
+    ]
+  },
+  {
+    "name": "需求方",
+    "type": "select",
+    "multiple": false,
+    "options": [
+      {
+        "name": "产品"
+      },
+      {
+        "name": "合约运营"
+      },
+      {
+        "name": "技术"
+      },
+      {
+        "name": "渠道运营"
+      },
+      {
+        "name": "现货运营"
+      },
+      {
+        "name": "量化"
+      },
+      {
+        "name": "风控"
+      },
+      {
+        "name": "平台运营"
+      }
+    ]
+  },
+  {
+    "name": "开始时间",
+    "type": "datetime"
+  },
+  {
+    "name": "提测时间",
+    "type": "datetime"
+  },
+  {
+    "name": "提交验收时间",
+    "type": "datetime"
+  },
+  {
+    "name": "原提交验收时间",
+    "type": "datetime"
+  },
+  {
+    "name": "最新提交验收时间",
+    "type": "datetime"
+  },
+  {
+    "name": "关闭时间",
+    "type": "datetime"
+  },
+  {
+    "name": "产品负责人",
+    "type": "user",
+    "multiple": false
+  },
+  {
+    "name": "项目经理",
+    "type": "user",
+    "multiple": false
+  },
+  {
+    "name": "开发预估工期",
+    "type": "text"
+  },
+  {
+    "name": "延期状态",
+    "type": "select",
+    "multiple": false,
+    "options": [
+      {
+        "name": "无提交验收时间"
+      },
+      {
+        "name": "未延期"
+      },
+      {
+        "name": "已延期"
+      },
+      {
+        "name": "已完成延期"
+      }
+    ]
+  },
+  {
+    "name": "延期原因",
+    "type": "text"
+  },
+  {
+    "name": "延期时长",
+    "type": "formula",
+    "expression": "IF(OR(ISBLANK([原提交验收时间]), ISBLANK([最新提交验收时间])), \"\", IF(DAYS([最新提交验收时间], [原提交验收时间]) > 0, TEXT(DAYS([最新提交验收时间], [原提交验收时间]), \"0\") & \"天\", \"\"))"
+  }
+]

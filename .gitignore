@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv-lark-sdk/
+node_modules/
+cache/
+logs/
+*.log
+*.sqlite
+*.db
+*.db-shm
+*.db-wal
+tmp/

@@ -4,10 +4,10 @@ Local Jira to Lark Base sync service.
 
 ## Layout
 
-- Source project: `/Users/bin/Projects/jira-lark-sync`
-- Runtime directory: `/Users/bin/.local/share/jira-lark-sync`
-- Private config: `/Users/bin/.config/jira-lark-sync/env`
-- LaunchAgent: `/Users/bin/Library/LaunchAgents/com.legend.jira-lark-sync.plist`
+- Source project: `~/Projects/jira-lark-sync`
+- Runtime directory: `~/.local/share/jira-lark-sync`
+- Private config: `~/.config/jira-lark-sync/env`
+- LaunchAgent: `~/Library/LaunchAgents/com.legend.jira-lark-sync.plist`
 
 Keep source, runtime data, and private config separate. Do not share `.env`, Jira tokens, Lark credentials, runtime cache, or logs.
 
@@ -28,4 +28,4 @@ Use `npm run deploy` after changing source code. It syncs source into the runtim
 
 Run `npm run doctor` to produce a redacted diagnostic report.
 
-Default refresh targets are configured in `config/tables.json`.
+Default refresh targets are configured in the private table config, usually `~/.config/jira-lark-sync/tables.json`. The shareable template is `config/tables.example.json`.

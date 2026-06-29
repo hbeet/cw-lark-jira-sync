@@ -8,7 +8,7 @@ import { checkJiraReachable as checkJiraReachableApi, jiraSearchAll as jiraSearc
 import { checkLarkReachable as checkLarkReachableApi, discoverSyncTableConfigs as discoverSyncTableConfigsApi } from "./lib/lark-base-sync.mjs";
 import { larkCliSync } from "./lib/lark-cli.mjs";
 import { createDecipheriv } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, truncateSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -43,6 +43,7 @@ const batchSyncSize = config.batch.size;
 const batchDispatchDelayMs = config.batch.dispatchDelayMs;
 const logRetentionDays = config.logs.retentionDays;
 const logRetentionMaxFiles = config.logs.retentionMaxFiles;
+const launchdLogMaxBytes = config.logs.launchdMaxBytes;
 const startupReadinessEnabled = config.startupReadiness.enabled;
 const startupReadinessMaxSeconds = config.startupReadiness.maxSeconds;
 const startupReadinessIntervalSeconds = config.startupReadiness.intervalSeconds;
@@ -436,13 +437,25 @@ function rotateLogs() {
         deleted += 1;
       } catch {}
     }
+    let truncated = 0;
+    for (const name of ["launchd-sync-server.out.log", "launchd-sync-server.err.log"]) {
+      const path = join(logsDir, name);
+      try {
+        if (existsSync(path) && statSync(path).size > launchdLogMaxBytes) {
+          truncateSync(path, 0);
+          truncated += 1;
+        }
+      } catch {}
+    }
     lastLogRotation = {
       ok: true,
       checked_at: startedAt.toISOString(),
       deleted,
+      truncated,
       kept: files.length - deleted,
       retention_days: logRetentionDays,
       max_files: logRetentionMaxFiles,
+      launchd_log_max_bytes: launchdLogMaxBytes,
     };
     return lastLogRotation;
   } catch (error) {

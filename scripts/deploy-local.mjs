@@ -4,11 +4,17 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadEnvFile } from "../lib/env-file.mjs";
 
 const sourceDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeDir = process.env.JIRA_LARK_RUNTIME_DIR || `${homedir()}/.local/share/jira-lark-sync`;
+const envFile = process.env.JIRA_LARK_ENV_FILE || `${homedir()}/.config/jira-lark-sync/env`;
+const runtimeEnv = existsSync(envFile) ? loadEnvFile(envFile) : {};
 const plistLabel = process.env.JIRA_LARK_LAUNCHD_LABEL || "com.legend.jira-lark-sync";
 const healthUrl = process.env.JIRA_LARK_HEALTH_URL || "http://127.0.0.1:8787/health";
+const requireEvent = process.env.JIRA_LARK_REQUIRE_EVENT
+  ? process.env.JIRA_LARK_REQUIRE_EVENT !== "0"
+  : runtimeEnv.LARK_EVENT_ENABLED !== "0";
 const uid = process.getuid?.();
 
 function run(command, args, options = {}) {
@@ -50,7 +56,7 @@ async function waitForHealth() {
       if (!response.ok) throw new Error(`status=${response.status}`);
       const status = await response.json();
       const ok = status.startup_readiness?.ok
-        && status.event?.listener_running
+        && (!requireEvent || status.event?.listener_running)
         && !status.running
         && Number(status.queued || 0) === 0;
       if (ok) {
@@ -81,7 +87,7 @@ rsync([
   "README.md",
   ".env.example",
   "config",
-  "lark_user_map.tsv",
+  "lark_user_map.example.tsv",
   "jira_lark_fields.json",
   "lib",
   "docs",

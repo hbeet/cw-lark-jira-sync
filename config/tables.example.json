@@ -1,0 +1,18 @@
+{
+  "defaultTargets": ["example"],
+  "defaultExpectedFields": [
+    "jira号",
+    "概要",
+    "迭代",
+    "状态"
+  ],
+  "tables": {
+    "example": {
+      "name": "Example Table",
+      "baseToken": "replace-with-lark-base-token",
+      "tableId": "replace-with-table-id",
+      "viewId": "replace-with-view-id",
+      "jiraField": "jira号"
+    }
+  }
+}

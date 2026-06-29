@@ -8,7 +8,9 @@ import { loadTableConfig, resolveTableTargets } from "../lib/table-config.mjs";
 
 const sourceDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const envFile = process.env.JIRA_LARK_ENV_FILE || `${process.env.HOME}/.config/jira-lark-sync/env`;
-const tableConfigPath = process.env.JIRA_LARK_TABLE_CONFIG || "config/tables.json";
+const privateTableConfigPath = `${process.env.HOME}/.config/jira-lark-sync/tables.json`;
+const tableConfigPath = process.env.JIRA_LARK_TABLE_CONFIG
+  || (existsSync(privateTableConfigPath) ? privateTableConfigPath : "config/tables.example.json");
 const healthUrl = process.env.JIRA_LARK_HEALTH_URL || "http://127.0.0.1:8787/health";
 const runtimeDir = process.env.JIRA_LARK_RUNTIME_DIR || `${process.env.HOME}/.local/share/jira-lark-sync`;
 
@@ -102,7 +104,8 @@ function checkTables(tableConfig) {
         "--format", "json",
       ]).data?.fields || [];
       const names = new Set(fields.map((field) => field.name));
-      const missing = expectedFields.filter((field) => !names.has(field));
+      const tableExpectedFields = table.expectedFields || tableConfig.defaultExpectedFields || expectedFields;
+      const missing = tableExpectedFields.filter((field) => !names.has(field));
       const statusTimelineCount = fields.filter((field) => /^进入.+时间$/.test(field.name || "")).length;
       results.push({
         key: table.key,

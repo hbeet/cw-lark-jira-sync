@@ -7,7 +7,7 @@ const dryRun = args.has("--dry-run");
 const noRestart = args.has("--no-restart");
 const noVerify = args.has("--no-verify");
 
-const runtimeEnvPath = process.env.JIRA_LARK_RUNTIME_ENV || "/Users/bin/.config/jira-lark-sync/env";
+const runtimeEnvPath = process.env.JIRA_LARK_RUNTIME_ENV || `${process.env.HOME}/.config/jira-lark-sync/env`;
 const projectEnvPath = process.env.JIRA_LARK_PROJECT_ENV || new URL("../.env", import.meta.url).pathname;
 const launchAgentLabel = process.env.JIRA_LARK_LAUNCH_AGENT_LABEL || "com.legend.jira-lark-sync";
 
@@ -18,6 +18,10 @@ function quoteShell(value) {
 function readEnvFile(path) {
   if (!existsSync(path)) throw new Error(`配置文件不存在：${path}`);
   return readFileSync(path, "utf8");
+}
+
+function readOptionalEnvFile(path) {
+  return existsSync(path) ? readFileSync(path, "utf8") : "";
 }
 
 function envValue(content, name) {
@@ -122,7 +126,7 @@ async function main() {
   console.log("");
 
   const runtimeEnv = readEnvFile(runtimeEnvPath);
-  const projectEnv = readEnvFile(projectEnvPath);
+  const projectEnv = readOptionalEnvFile(projectEnvPath);
   const jiraBaseUrl = envValue(runtimeEnv, "JIRA_BASE_URL") || envValue(projectEnv, "JIRA_BASE_URL");
   if (!jiraBaseUrl) throw new Error("没有找到 JIRA_BASE_URL，请先完成基础配置。");
 
@@ -145,10 +149,14 @@ async function main() {
   }
 
   writeFileSync(`${runtimeEnvPath}.bak`, runtimeEnv, { mode: 0o600 });
-  writeFileSync(`${projectEnvPath}.bak`, projectEnv, { mode: 0o600 });
   writeFileSync(runtimeEnvPath, replaceExport(runtimeEnv, "JIRA_TOKEN", token), { mode: 0o600 });
-  writeFileSync(projectEnvPath, replaceExport(projectEnv, "JIRA_TOKEN", token), { mode: 0o600 });
-  console.log("配置已写入，并已生成 .bak 备份。");
+  if (projectEnv) {
+    writeFileSync(`${projectEnvPath}.bak`, projectEnv, { mode: 0o600 });
+    writeFileSync(projectEnvPath, replaceExport(projectEnv, "JIRA_TOKEN", token), { mode: 0o600 });
+    console.log("运行配置和项目 .env 已写入，并已生成 .bak 备份。");
+  } else {
+    console.log("运行配置已写入，并已生成 .bak 备份。项目 .env 不存在，已跳过。");
+  }
 
   if (!noRestart) {
     restartService();

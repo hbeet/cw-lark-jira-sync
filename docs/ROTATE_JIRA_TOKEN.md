@@ -15,7 +15,7 @@
 进入同步服务目录：
 
 ```bash
-cd /Users/bin/Projects/jira-lark-sync
+cd ~/Projects/jira-lark-sync
 ```
 
 运行向导：
@@ -30,9 +30,9 @@ node scripts/rotate-jira-token.mjs
 
 1. 从配置中读取 `JIRA_BASE_URL`
 2. 以星号掩码读取新的 `JIRA_TOKEN`
-3. 调用 Jira `/rest/api/2/serverInfo` 验证 token
-4. 更新运行配置 `/Users/bin/.config/jira-lark-sync/env`
-5. 更新项目配置 `.env`
+3. 调用 Jira `/rest/api/2/myself` 验证 token
+4. 更新运行配置 `~/.config/jira-lark-sync/env`
+5. 如果项目 `.env` 存在，也会同步更新；否则跳过
 6. 重启本机 LaunchAgent 服务
 
 ## 验证

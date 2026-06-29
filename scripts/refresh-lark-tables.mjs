@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,8 +9,11 @@ import { loadTableConfig, resolveTableTargets } from "../lib/table-config.mjs";
 
 const sourceDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const envFile = process.env.JIRA_LARK_ENV_FILE || `${process.env.HOME}/.config/jira-lark-sync/env`;
-const tableConfigPath = process.env.JIRA_LARK_TABLE_CONFIG || "config/tables.json";
+const privateTableConfigPath = `${process.env.HOME}/.config/jira-lark-sync/tables.json`;
+const tableConfigPath = process.env.JIRA_LARK_TABLE_CONFIG
+  || (existsSync(privateTableConfigPath) ? privateTableConfigPath : "config/tables.example.json");
 const mode = process.argv[2] || "all";
+const refreshChunkSize = Math.max(1, Math.min(Number(process.env.JIRA_LARK_REFRESH_CHUNK_SIZE || 150), 200));
 
 const syncFields = new Set([
   "jira号",
@@ -104,27 +107,34 @@ async function refreshTable(config, env) {
   console.log(`${config.name}: rows=${rows.length} unique=${uniqueKeys.length}`);
   if (uniqueKeys.length === 0) return;
 
-  const tempDir = mkdtempSync(join(tmpdir(), "jira-lark-refresh-"));
-  const mapFile = join(tempDir, "record-map.tsv");
-  writeFileSync(mapFile, rows.map((row) => `${row.jiraKey}\t${row.recordId}`).join("\n") + "\n");
-  try {
-    run(process.execPath, ["sync-runner.mjs"], {
-      env: {
-        ...env,
-        LARK_BASE_TOKEN: config.baseToken,
-        LARK_TABLE_ID: config.tableId,
-        LARK_TARGET_RECORD_MAP_FILE: mapFile,
-        LARK_FIELD_MAPPING_JSON: JSON.stringify(fieldMapping(config)),
-        LARK_FIELD_MAPPING_STRICT: "1",
-        LARK_JIRA_FIELD_NAME: config.jiraField || "jira号",
-        JIRA_JQL: `key in (${uniqueKeys.join(",")})`,
-        JIRA_MAX: String(uniqueKeys.length),
-        JIRA_PAGE_SIZE: "50",
-        LARK_NATIVE_BATCH_CHUNK_SIZE: "50",
-      },
-    });
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
+  const mapping = JSON.stringify(fieldMapping(config));
+  for (let i = 0; i < uniqueKeys.length; i += refreshChunkSize) {
+    const chunkKeys = uniqueKeys.slice(i, i + refreshChunkSize);
+    const chunkSet = new Set(chunkKeys);
+    const chunkRows = rows.filter((row) => chunkSet.has(row.jiraKey));
+    const tempDir = mkdtempSync(join(tmpdir(), "jira-lark-refresh-"));
+    const mapFile = join(tempDir, "record-map.tsv");
+    writeFileSync(mapFile, chunkRows.map((row) => `${row.jiraKey}\t${row.recordId}`).join("\n") + "\n");
+    console.log(`${config.name}: chunk=${Math.floor(i / refreshChunkSize) + 1}/${Math.ceil(uniqueKeys.length / refreshChunkSize)} unique=${chunkKeys.length} rows=${chunkRows.length}`);
+    try {
+      run(process.execPath, ["sync-runner.mjs"], {
+        env: {
+          ...env,
+          LARK_BASE_TOKEN: config.baseToken,
+          LARK_TABLE_ID: config.tableId,
+          LARK_TARGET_RECORD_MAP_FILE: mapFile,
+          LARK_FIELD_MAPPING_JSON: mapping,
+          LARK_FIELD_MAPPING_STRICT: "1",
+          LARK_JIRA_FIELD_NAME: config.jiraField || "jira号",
+          JIRA_JQL: `key in (${chunkKeys.join(",")})`,
+          JIRA_MAX: String(chunkKeys.length),
+          JIRA_PAGE_SIZE: "50",
+          LARK_NATIVE_BATCH_CHUNK_SIZE: "50",
+        },
+      });
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   }
 }
 

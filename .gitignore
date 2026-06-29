@@ -2,6 +2,10 @@
 .env
 .env.*
 !.env.example
+config/tables.json
+!config/tables.example.json
+lark_user_map.tsv
+!lark_user_map.example.tsv
 .venv-lark-sdk/
 node_modules/
 cache/

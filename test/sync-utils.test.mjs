@@ -16,19 +16,19 @@ import {
 test("extractJiraKey reads plain text, markdown links, plain Jira URLs, and link cells", () => {
   assert.equal(extractJiraKey("CW-41606"), "CW-41606");
   assert.equal(extractJiraKey("[CW-59338](https://jira/browse/CW-59338)"), "CW-59338");
-  assert.equal(extractJiraKey("https://jira.legenddigital.work/browse/CW-55485"), "CW-55485");
-  assert.equal(extractJiraKey({ text: "CW-55485", link: "https://jira.legenddigital.work/browse/CW-55485" }), "CW-55485");
+  assert.equal(extractJiraKey("https://jira.example.com/browse/CW-55485"), "CW-55485");
+  assert.equal(extractJiraKey({ text: "CW-55485", link: "https://jira.example.com/browse/CW-55485" }), "CW-55485");
 });
 
 test("jira link helpers keep display text as Jira key and click target as browse URL", () => {
-  const base = "https://jira.legenddigital.work/";
+  const base = "https://jira.example.com/";
   assert.deepEqual(jiraLinkCell("CW-55485", base), {
     text: "CW-55485",
-    link: "https://jira.legenddigital.work/browse/CW-55485",
+    link: "https://jira.example.com/browse/CW-55485",
   });
   assert.equal(
     jiraMarkdownLink("CW-55485", base),
-    "[CW-55485](https://jira.legenddigital.work/browse/CW-55485)",
+    "[CW-55485](https://jira.example.com/browse/CW-55485)",
   );
 });
 

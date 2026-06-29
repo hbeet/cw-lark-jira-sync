@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(cd "$(dirname "$0")" && pwd)"
 set -a
-source /Users/bin/.config/jira-lark-sync/env
+source "${JIRA_LARK_ENV_FILE:-$HOME/.config/jira-lark-sync/env}"
 set +a
 
-exec /Users/bin/.local/bin/node sync-server.mjs
+exec "${JIRA_LARK_NODE:-$(command -v node)}" sync-server.mjs

@@ -1,0 +1,14 @@
+{
+  "name": "jira-lark-sync-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Jira-Lark sync service — query Jira, operate Lark tables, trigger syncs",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "jira-lark-mcp": "./server.mjs"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check lib/mcp-transport.mjs && node --check lib/tools-sync.mjs && node --check lib/tools-jira.mjs && node --check lib/tools-lark.mjs"
+  }
+}

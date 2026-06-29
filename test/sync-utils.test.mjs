@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { closeDb, configureDb, dbExec, dbQuery, sqlString } from "../lib/db.mjs";
+import { closeDb, configureDb, dbExec, dbRun, dbAll } from "../lib/db.mjs";
 import {
   delayStatusValue,
   extractJiraKey,
@@ -53,8 +53,8 @@ test("db module runs statements without spawning sqlite3", () => {
     closeDb();
     configureDb(join(dir, "test.db"));
     dbExec("CREATE TABLE sample (id INTEGER PRIMARY KEY, name TEXT);");
-    dbExec(`INSERT INTO sample (name) VALUES (${sqlString("O'Hara")});`);
-    assert.deepEqual(dbQuery("SELECT name FROM sample;"), [{ name: "O'Hara" }]);
+    dbRun("INSERT INTO sample (name) VALUES (?);", ["O'Hara"]);
+    assert.deepEqual(dbAll("SELECT name FROM sample;", []), [{ name: "O'Hara" }]);
   } finally {
     closeDb();
     rmSync(dir, { recursive: true, force: true });

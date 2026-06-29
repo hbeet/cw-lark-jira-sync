@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { configureDb, dbExec, dbQuery, sqlString } from "./lib/db.mjs";
+import { configureDb, dbAll, dbExec, dbRun } from "./lib/db.mjs";
 import { larkCliJson, larkCliSync } from "./lib/lark-cli.mjs";
 import { delayStatusValue, jiraLinkCell, latestSprintName, parseJiraDate } from "./lib/sync-utils.mjs";
 
@@ -48,7 +48,6 @@ const defaultFieldMapping = {
 };
 
 let fieldMapping = JSON.parse(process.env.LARK_FIELD_MAPPING_JSON || JSON.stringify(defaultFieldMapping));
-const batchRecords = [];
 
 if (process.env.LARK_SYNC_DB_PATH) {
   configureDb(process.env.LARK_SYNC_DB_PATH);
@@ -64,7 +63,12 @@ if (process.env.LARK_SYNC_DB_PATH) {
   `);
   try {
     dbExec("ALTER TABLE jira_changelog_cache ADD COLUMN status_entered_json TEXT;");
-  } catch {}
+  } catch (error) {
+    // Expected if column already exists
+    if (!/duplicate column/i.test(error.message)) {
+      console.error("[schema migration] unexpected error:", error.message);
+    }
+  }
 }
 
 function jiraHeaders() {
@@ -146,6 +150,16 @@ function resolveEffectiveFieldMapping() {
   fieldMapping = Object.fromEntries(Object.entries(fieldMapping).map(([key, value]) => [key, idToName[value] || value]));
 }
 
+async function fetchWithRetry(fn, retries = 2, delayMs = 1000) {
+  for (let i = 0; i <= retries; i++) {
+    try { return await fn(); }
+    catch (err) {
+      if (i === retries) throw err;
+      await new Promise(r => setTimeout(r, delayMs * (i + 1)));
+    }
+  }
+}
+
 function loadUserMap() {
   if (!existsSync(larkUserMapFile)) return new Map();
   const rows = readFileSync(larkUserMapFile, "utf8").split(/\r?\n/).filter(Boolean);
@@ -208,13 +222,12 @@ function parseStatusEnteredJson(value) {
 
 async function changelogDataForIssue(issueKey, latestAcceptance, jiraUpdated) {
   if (process.env.LARK_SYNC_DB_PATH) {
-    const cached = dbQuery(`
+    const cached = dbAll(`
       SELECT original_acceptance_time, status_entered_json
       FROM jira_changelog_cache
-      WHERE jira_key=${sqlString(issueKey)}
-        AND jira_updated=${sqlString(jiraUpdated)}
+      WHERE jira_key=? AND jira_updated=?
       LIMIT 1;
-    `)[0];
+    `, [issueKey, jiraUpdated])[0];
     if (cached && (statusTimelineFieldNames().length === 0 || cached.status_entered_json)) {
       console.error(`changelog_cache_hit ${issueKey}`);
       return {
@@ -225,10 +238,10 @@ async function changelogDataForIssue(issueKey, latestAcceptance, jiraUpdated) {
     console.error(`changelog_cache_miss ${issueKey}`);
   }
 
-  const issue = await jiraGet(`/issue/${issueKey}`, {
+  const issue = await fetchWithRetry(() => jiraGet(`/issue/${issueKey}`, {
     expand: "changelog",
     fields: "customfield_12203,status,created",
-  });
+  }));
   const changes = [];
   const statusEntered = {};
   const statusHistories = [];
@@ -262,24 +275,17 @@ async function changelogDataForIssue(issueKey, latestAcceptance, jiraUpdated) {
 
   if (process.env.LARK_SYNC_DB_PATH) {
     const now = new Date().toISOString();
-    dbExec(`
+    dbRun(`
       INSERT INTO jira_changelog_cache (
         jira_key, original_acceptance_time, latest_acceptance_time, jira_updated, status_entered_json, updated_at
-      ) VALUES (
-        ${sqlString(issueKey)},
-        ${sqlString(original)},
-        ${sqlString(latestAcceptance)},
-        ${sqlString(jiraUpdated)},
-        ${sqlString(JSON.stringify(statusEntered))},
-        ${sqlString(now)}
-      )
+      ) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(jira_key) DO UPDATE SET
         original_acceptance_time=excluded.original_acceptance_time,
         latest_acceptance_time=excluded.latest_acceptance_time,
         jira_updated=excluded.jira_updated,
         status_entered_json=excluded.status_entered_json,
         updated_at=excluded.updated_at;
-    `);
+    `, [issueKey, original, latestAcceptance, jiraUpdated, JSON.stringify(statusEntered), now]);
   }
   return { originalAcceptance: original, statusEntered };
 }
@@ -525,7 +531,9 @@ function batchUpdate(records) {
           chunks += 1;
           continue;
         }
-      } catch {}
+      } catch (error) {
+        console.error(`[batchUpdate] failed to parse response: ${error.message}`);
+      }
     }
     console.error("batch_update chunk failed, falling back to per-record upsert");
     if (result.stdout) console.error(result.stdout.slice(0, 2000));
@@ -539,6 +547,7 @@ async function main() {
   resolveEffectiveFieldMapping();
   const userMap = loadUserMap();
   const recordMap = loadTargetRecordMap();
+  const batchRecords = [];
   let startAt = 0;
   let synced = 0;
 

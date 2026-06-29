@@ -1,14 +1,21 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createConfig, publicConfigSummary } from "./lib/config.mjs";
-import { configureDb, dbExec, dbQuery, sqlString } from "./lib/db.mjs";
+import { configureDb, dbAll, dbExec, dbOne, dbRun } from "./lib/db.mjs";
 import { jobErrorSummary, jobHistoryForJira, listJobErrors } from "./lib/diagnostics.mjs";
 import { DEFAULT_FIELD_MAPPING, mappingForEnv } from "./lib/field-registry.mjs";
+import {
+  upsertCachedRecord, removeCachedRecord, cachedRecordsForJira,
+  indexedJiraKeys, indexedRecordsForTable, clearIndexCache,
+  indexRecordCount, indexJiraKeyCount, migrateJsonCacheToDb, rebuildIndexFromLark,
+} from "./lib/index-cache.mjs";
+import { chunkArray } from "./lib/incremental.mjs";
 import { checkJiraReachable as checkJiraReachableApi, jiraSearchAll as jiraSearchAllApi } from "./lib/jira-client.mjs";
+import { extractJiraKey } from "./lib/sync-utils.mjs";
 import { checkLarkReachable as checkLarkReachableApi, discoverSyncTableConfigs as discoverSyncTableConfigsApi } from "./lib/lark-base-sync.mjs";
 import { larkCliSync } from "./lib/lark-cli.mjs";
 import { createDecipheriv } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, truncateSync, unlinkSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, truncateSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -38,6 +45,7 @@ const jiraReachabilityCheckEnabled = config.jira.reachabilityCheckEnabled;
 const jiraReachabilityTimeoutMs = config.jira.reachabilityTimeoutMs;
 const maxJobAttempts = config.jobs.maxAttempts;
 const runningJobStaleSeconds = config.jobs.runningStaleSeconds;
+const processTimeoutMs = config.jobs.processTimeoutMs;
 const batchSyncEnabled = config.batch.enabled;
 const batchSyncSize = config.batch.size;
 const batchDispatchDelayMs = config.batch.dispatchDelayMs;
@@ -50,17 +58,20 @@ const startupReadinessIntervalSeconds = config.startupReadiness.intervalSeconds;
 
 configureDb(dbPath);
 
+// --- mutable state ---
 let running = false;
 let lastRun = null;
 const processedRecordVersions = new Map();
 let eventListener = null;
+let eventListenerConsecutiveFailures = 0;
+const EVENT_LISTENER_MAX_BACKOFF_MS = 5 * 60 * 1000;
+const EVENT_LISTENER_MAX_CONSECUTIVE_FAILURES = 20;
 let lastEvent = null;
 let incrementalRunning = false;
 let lastIncremental = null;
 let lastJiraReachability = null;
 let incrementalRetryTimer = null;
 let fieldCache = new Map();
-let syncCache = loadSyncCache();
 let dispatchTimer = null;
 let lastRecoveredRunningJobs = null;
 let syncTableConfigCache = { loadedAt: 0, configs: [], error: "" };
@@ -147,263 +158,9 @@ function initDb() {
   `);
 }
 
-function defaultCache() {
-  return {
-    version: 1,
-    updated_at: new Date().toISOString(),
-    records: {},
-    jira_to_records: {},
-  };
-}
 
-function loadSyncCache() {
-  try {
-    if (!existsSync(cachePath)) return defaultCache();
-    const parsed = JSON.parse(readFileSync(cachePath, "utf8"));
-    return {
-      ...defaultCache(),
-      ...parsed,
-      records: parsed.records || {},
-      jira_to_records: parsed.jira_to_records || {},
-    };
-  } catch {
-    return defaultCache();
-  }
-}
-
-function saveSyncCache() {
-  const dir = dirname(cachePath);
-  mkdirSync(dir, { recursive: true });
-  syncCache.updated_at = new Date().toISOString();
-  const tmpPath = `${cachePath}.tmp`;
-  writeFileSync(tmpPath, `${JSON.stringify(syncCache, null, 2)}\n`, { mode: 0o600 });
-  renameSync(tmpPath, cachePath);
-}
-
-function cacheRecordKey(tableId, recordId) {
-  return `${tableId}:${recordId}`;
-}
-
-function rebuildJiraIndex() {
-  syncCache.jira_to_records = {};
-  for (const [key, record] of Object.entries(syncCache.records || {})) {
-    if (!record?.jira_key) continue;
-    if (!syncCache.jira_to_records[record.jira_key]) {
-      syncCache.jira_to_records[record.jira_key] = [];
-    }
-    if (!syncCache.jira_to_records[record.jira_key].includes(key)) {
-      syncCache.jira_to_records[record.jira_key].push(key);
-    }
-  }
-}
-
-function upsertCachedRecord({ tableId, recordId, jiraKey, inDefaultScope = null, jiraUpdated = "", source = "" }) {
-  if (!tableId || !recordId || !jiraKey) return;
-  const now = new Date().toISOString();
-  const key = cacheRecordKey(tableId, recordId);
-  const previous = syncCache.records[key] || {};
-  syncCache.records[key] = {
-    ...previous,
-    jira_key: jiraKey,
-    table_id: tableId,
-    record_id: recordId,
-    in_default_scope: inDefaultScope === null ? previous.in_default_scope ?? null : Boolean(inDefaultScope),
-    jira_updated: jiraUpdated || previous.jira_updated || "",
-    last_synced_at: now,
-    source: source || previous.source || "",
-  };
-  dbExec(`
-    INSERT INTO jira_index (
-      table_id, record_id, jira_key, in_default_scope, jira_updated, last_synced_at, source, updated_at
-    ) VALUES (
-      ${sqlString(tableId)}, ${sqlString(recordId)}, ${sqlString(jiraKey)},
-      ${inDefaultScope === null ? "NULL" : (inDefaultScope ? 1 : 0)},
-      ${sqlString(jiraUpdated || previous.jira_updated || "")},
-      ${sqlString(now)}, ${sqlString(source || previous.source || "")}, ${sqlString(now)}
-    )
-    ON CONFLICT(table_id, record_id) DO UPDATE SET
-      jira_key=excluded.jira_key,
-      in_default_scope=COALESCE(excluded.in_default_scope, jira_index.in_default_scope),
-      jira_updated=COALESCE(NULLIF(excluded.jira_updated, ''), jira_index.jira_updated),
-      last_synced_at=excluded.last_synced_at,
-      source=COALESCE(NULLIF(excluded.source, ''), jira_index.source),
-      updated_at=excluded.updated_at;
-  `);
-  rebuildJiraIndex();
-  saveSyncCache();
-}
-
-function removeCachedRecord(tableId, recordId) {
-  if (!tableId || !recordId) return;
-  delete syncCache.records[cacheRecordKey(tableId, recordId)];
-  dbExec(`DELETE FROM jira_index WHERE table_id=${sqlString(tableId)} AND record_id=${sqlString(recordId)};`);
-  rebuildJiraIndex();
-  saveSyncCache();
-}
-
-function cachedRecordsForJira(jiraKey) {
-  try {
-    const rows = dbQuery(`SELECT table_id, record_id, jira_key, in_default_scope, jira_updated, last_synced_at, source FROM jira_index WHERE jira_key=${sqlString(jiraKey)};`);
-    if (rows.length > 0) {
-      return rows.map((row) => ({
-        table_id: row.table_id,
-        record_id: row.record_id,
-        jira_key: row.jira_key,
-        in_default_scope: row.in_default_scope === null ? null : Boolean(row.in_default_scope),
-        jira_updated: row.jira_updated || "",
-        last_synced_at: row.last_synced_at || "",
-        source: row.source || "",
-      }));
-    }
-  } catch {}
-  const keys = syncCache.jira_to_records?.[jiraKey] || [];
-  return keys.map((key) => syncCache.records[key]).filter(Boolean);
-}
-
-function indexedJiraKeys() {
-  try {
-    return dbQuery("SELECT DISTINCT jira_key FROM jira_index WHERE jira_key <> '' ORDER BY jira_key;")
-      .map((row) => row.jira_key)
-      .filter(Boolean);
-  } catch {
-    return [...new Set(Object.values(syncCache.records || {})
-      .filter((record) => record?.jira_key)
-      .map((record) => record.jira_key))];
-  }
-}
-
-function indexedRecordsForTable(tableId) {
-  try {
-    return dbQuery(`
-      SELECT table_id, record_id, jira_key, in_default_scope, jira_updated
-      FROM jira_index
-      WHERE table_id=${sqlString(tableId)}
-        AND jira_key <> ''
-        AND record_id <> ''
-      ORDER BY jira_key, record_id;
-    `).map((row) => ({
-      table_id: row.table_id,
-      record_id: row.record_id,
-      jira_key: row.jira_key,
-      in_default_scope: row.in_default_scope === null ? null : Boolean(row.in_default_scope),
-      jira_updated: row.jira_updated || "",
-    }));
-  } catch {
-    return Object.values(syncCache.records || {})
-      .filter((record) => record?.table_id === tableId && record.record_id && record.jira_key)
-      .map((record) => ({
-        table_id: record.table_id,
-        record_id: record.record_id,
-        jira_key: record.jira_key,
-        in_default_scope: record.in_default_scope ?? null,
-        jira_updated: record.jira_updated || "",
-      }));
-  }
-}
-
-function importJsonCacheToDb() {
-  for (const record of Object.values(syncCache.records || {})) {
-    if (!record?.table_id || !record?.record_id || !record?.jira_key) continue;
-    upsertCachedRecord({
-      tableId: record.table_id,
-      recordId: record.record_id,
-      jiraKey: record.jira_key,
-      inDefaultScope: record.in_default_scope ?? null,
-      jiraUpdated: record.jira_updated || "",
-      source: record.source || "json_cache_import",
-    });
-  }
-}
-
-function clearIndexCache() {
-  syncCache.records = {};
-  syncCache.jira_to_records = {};
-  saveSyncCache();
-  dbExec("DELETE FROM jira_index;");
-}
-
-function rebuildIndexFromLark() {
-  if (!process.env.LARK_BASE_TOKEN) {
-    throw new Error("missing LARK_BASE_TOKEN");
-  }
-  const startedAt = new Date();
-  const scanned = [];
-  let indexed = 0;
-  const previous = new Map();
-  try {
-    for (const row of dbQuery("SELECT table_id, record_id, in_default_scope, jira_updated, source FROM jira_index;")) {
-      previous.set(cacheRecordKey(row.table_id, row.record_id), {
-        in_default_scope: row.in_default_scope === null ? null : Boolean(row.in_default_scope),
-        jira_updated: row.jira_updated || "",
-        source: row.source || "",
-      });
-    }
-  } catch {}
-  clearIndexCache();
-
-  for (const table of loadSyncTableConfigs()) {
-    let offset = 0;
-    let tableIndexed = 0;
-    const jiraField = table.jiraField || "jira号";
-    while (true) {
-      const result = larkCliSync( [
-        "base",
-        "+record-list",
-        "--as",
-        process.env.LARK_AS || "user",
-        "--base-token",
-        process.env.LARK_BASE_TOKEN,
-        "--table-id",
-        table.id,
-        "--field-id",
-        jiraField,
-        "--offset",
-        String(offset),
-        "--limit",
-        "200",
-        "--format",
-        "json",
-      ], {
-        cwd: __dirname,
-        env: process.env,
-        encoding: "utf8",
-      });
-      if (result.status !== 0 || !result.stdout) {
-        scanned.push({ table_id: table.id, table_name: table.name, indexed: tableIndexed, error: result.stderr || "record-list failed" });
-        break;
-      }
-      const records = JSON.parse(result.stdout);
-      const recordIds = records?.data?.record_id_list || [];
-      const rows = records?.data?.data || [];
-      for (let i = 0; i < rows.length; i += 1) {
-        const recordId = recordIds[i];
-        const jiraKey = extractJiraKey(rows[i]?.[0] ?? "");
-        if (!recordId || !jiraKey) continue;
-        const previousRecord = previous.get(cacheRecordKey(table.id, recordId)) || {};
-        upsertCachedRecord({
-          tableId: table.id,
-          recordId,
-          jiraKey,
-          inDefaultScope: previousRecord.in_default_scope ?? null,
-          jiraUpdated: previousRecord.jira_updated || "",
-          source: "rebuild_index",
-        });
-        indexed += 1;
-        tableIndexed += 1;
-      }
-      if (!records?.data?.has_more || rows.length === 0) break;
-      offset += rows.length;
-    }
-    scanned.push({ table_id: table.id, table_name: table.name, indexed: tableIndexed });
-  }
-
-  return {
-    ok: true,
-    started_at: startedAt.toISOString(),
-    finished_at: new Date().toISOString(),
-    indexed,
-    scanned,
-  };
+function doRebuildIndex() {
+  return rebuildIndexFromLark({ env: process.env, cwd: __dirname, loadSyncTableConfigs });
 }
 
 function rotateLogs() {
@@ -435,7 +192,9 @@ function rotateLogs() {
       try {
         unlinkSync(path);
         deleted += 1;
-      } catch {}
+      } catch (error) {
+        console.error(`[rotateLogs] failed to delete ${path}: ${error.message}`);
+      }
     }
     let truncated = 0;
     for (const name of ["launchd-sync-server.out.log", "launchd-sync-server.err.log"]) {
@@ -445,7 +204,9 @@ function rotateLogs() {
           truncateSync(path, 0);
           truncated += 1;
         }
-      } catch {}
+      } catch (error) {
+        console.error(`[rotateLogs] failed to truncate ${path}: ${error.message}`);
+      }
     }
     lastLogRotation = {
       ok: true,
@@ -464,18 +225,6 @@ function rotateLogs() {
   }
 }
 
-function extractJiraKey(value) {
-  if (typeof value === "string") {
-    return value.match(/\b[A-Z][A-Z0-9]+-\d+\b/)?.[0] || "";
-  }
-  if (Array.isArray(value)) {
-    return value.map(extractJiraKey).find(Boolean) || "";
-  }
-  if (value && typeof value === "object") {
-    return Object.values(value).map(extractJiraKey).find(Boolean) || "";
-  }
-  return "";
-}
 
 function parseLarkEventFieldValue(value) {
   if (typeof value !== "string") return value;
@@ -546,7 +295,7 @@ function loadSyncTableConfigs({ force = false } = {}) {
 
 function getSyncTableConfig(tableId) {
   if (!tableId) return null;
-  return loadSyncTableConfigs().find((config) => config.id === tableId) || null;
+  return loadSyncTableConfigs().find((tc) => tc.id === tableId) || null;
 }
 
 function cachedSyncTableConfigs() {
@@ -557,28 +306,28 @@ function healthSyncTableConfigs() {
   return syncTableConfigCache.loadedAt ? cachedSyncTableConfigs() : loadSyncTableConfigs();
 }
 
-function envForTableConfig(config = {}) {
+function envForTableConfig(tableConfig = {}) {
   return {
-    LARK_JIRA_FIELD_NAME: config.jiraField || "jira号",
-    ...mappingForEnv(config.fieldMapping || DEFAULT_FIELD_MAPPING),
+    LARK_JIRA_FIELD_NAME: tableConfig.jiraField || "jira号",
+    ...mappingForEnv(tableConfig.fieldMapping || DEFAULT_FIELD_MAPPING),
   };
 }
 
-function validateTableConfig(config) {
+function validateTableConfig(tableConfig) {
   const required = [
-    ["jiraField", config.jiraField],
-    ["summaryField", config.summaryField],
-    ["sprintField", config.sprintField],
-    ["updatedAtField", config.updatedAtField],
+    ["jiraField", tableConfig.jiraField],
+    ["summaryField", tableConfig.summaryField],
+    ["sprintField", tableConfig.sprintField],
+    ["updatedAtField", tableConfig.updatedAtField],
   ].filter(([, field]) => field);
   const missing = [];
   for (const [key, field] of required) {
-    if (!getTableFieldId(config.id, field)) missing.push({ key, field });
+    if (!getTableFieldId(tableConfig.id, field)) missing.push({ key, field });
   }
   const mappedMissing = [];
-  for (const [canonical, field] of Object.entries(config.fieldMapping || {})) {
+  for (const [canonical, field] of Object.entries(tableConfig.fieldMapping || {})) {
     if (!field) continue;
-    if (!getTableFieldId(config.id, field)) mappedMissing.push({ canonical, field });
+    if (!getTableFieldId(tableConfig.id, field)) mappedMissing.push({ canonical, field });
   }
   return {
     ok: missing.length === 0 && mappedMissing.length === 0,
@@ -710,7 +459,14 @@ function runSync(trigger = {}, options = {}) {
   child.stdout.pipe(logStream, { end: false });
   child.stderr.pipe(logStream, { end: false });
 
+  const processTimeout = setTimeout(() => {
+    logStream.write(`\ntimeout: killing process after ${processTimeoutMs / 1000}s\n`);
+    child.kill("SIGTERM");
+    setTimeout(() => { if (!child.killed) child.kill("SIGKILL"); }, 5000);
+  }, processTimeoutMs);
+
   child.on("close", (code) => {
+    clearTimeout(processTimeout);
     const finishedAt = new Date();
     running = false;
     lastRun = {
@@ -754,6 +510,7 @@ function runSync(trigger = {}, options = {}) {
   });
 
   child.on("error", (error) => {
+    clearTimeout(processTimeout);
     const finishedAt = new Date();
     running = false;
     lastRun = {
@@ -794,7 +551,7 @@ function jobFromRow(row) {
 
 function queuedCount() {
   try {
-    return Number(dbQuery("SELECT count(*) AS count FROM sync_jobs WHERE status IN ('pending', 'retry', 'running');")[0]?.count || 0);
+    return Number(dbAll("SELECT count(*) AS count FROM sync_jobs WHERE status IN ('pending', 'retry', 'running');", [])[0]?.count || 0);
   } catch {
     return 0;
   }
@@ -802,7 +559,7 @@ function queuedCount() {
 
 function jobStats() {
   try {
-    const rows = dbQuery("SELECT status, count(*) AS count FROM sync_jobs GROUP BY status ORDER BY status;");
+    const rows = dbAll("SELECT status, count(*) AS count FROM sync_jobs GROUP BY status ORDER BY status;", []);
     return Object.fromEntries(rows.map((row) => [row.status, Number(row.count || 0)]));
   } catch {
     return {};
@@ -810,26 +567,36 @@ function jobStats() {
 }
 
 function listJobs({ status = "", limit = 50 } = {}) {
-  const where = status ? `WHERE status=${sqlString(status)}` : "";
-  return dbQuery(`
+  const boundedLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  if (status) {
+    return dbAll(`
+      SELECT id, table_id, record_id, jira_key, source, status, attempts, next_run_at, last_error, created_at, updated_at
+      FROM sync_jobs
+      WHERE status=?
+      ORDER BY id DESC
+      LIMIT ?;
+    `, [status, boundedLimit]);
+  }
+  return dbAll(`
     SELECT id, table_id, record_id, jira_key, source, status, attempts, next_run_at, last_error, created_at, updated_at
     FROM sync_jobs
-    ${where}
     ORDER BY id DESC
-    LIMIT ${Math.min(Math.max(Number(limit) || 50, 1), 200)};
-  `);
+    LIMIT ?;
+  `, [boundedLimit]);
 }
 
 function retryFailedJobs({ ids = [] } = {}) {
   const now = new Date().toISOString();
   const idList = Array.isArray(ids) ? ids.map(Number).filter(Number.isFinite) : [];
-  const where = idList.length > 0 ? `status='failed' AND id IN (${idList.join(",")})` : "status='failed'";
-  const before = dbQuery(`SELECT count(*) AS count FROM sync_jobs WHERE ${where};`)[0]?.count || 0;
-  dbExec(`
-    UPDATE sync_jobs
-    SET status='pending', next_run_at=${sqlString(now)}, last_error=NULL, updated_at=${sqlString(now)}
-    WHERE ${where};
-  `);
+  if (idList.length > 0) {
+    const placeholders = idList.map(() => "?").join(",");
+    const before = dbOne(`SELECT count(*) AS count FROM sync_jobs WHERE status='failed' AND id IN (${placeholders});`, idList)?.count || 0;
+    dbRun(`UPDATE sync_jobs SET status='pending', next_run_at=?, last_error=NULL, updated_at=? WHERE status='failed' AND id IN (${placeholders});`, [now, now, ...idList]);
+    scheduleDispatch(0);
+    return { ok: true, retried: Number(before || 0) };
+  }
+  const before = dbOne("SELECT count(*) AS count FROM sync_jobs WHERE status='failed';")?.count || 0;
+  dbRun("UPDATE sync_jobs SET status='pending', next_run_at=?, last_error=NULL, updated_at=? WHERE status='failed';", [now, now]);
   scheduleDispatch(0);
   return { ok: true, retried: Number(before || 0) };
 }
@@ -837,13 +604,7 @@ function retryFailedJobs({ ids = [] } = {}) {
 function recoverStaleRunningJobs(reason = "periodic") {
   if (running || !runningJobStaleSeconds) return { ok: true, recovered: 0, reason };
   const cutoff = new Date(Date.now() - runningJobStaleSeconds * 1000).toISOString();
-  const rows = dbQuery(`
-    SELECT id, jira_key, updated_at
-    FROM sync_jobs
-    WHERE status='running' AND updated_at < ${sqlString(cutoff)}
-    ORDER BY id ASC
-    LIMIT 200;
-  `);
+  const rows = dbAll("SELECT id, jira_key, updated_at FROM sync_jobs WHERE status='running' AND updated_at < ? ORDER BY id ASC LIMIT 200;", [cutoff]);
   if (rows.length === 0) {
     lastRecoveredRunningJobs = {
       ok: true,
@@ -856,14 +617,10 @@ function recoverStaleRunningJobs(reason = "periodic") {
   }
 
   const now = new Date().toISOString();
-  dbExec(`
-    UPDATE sync_jobs
-    SET status='retry',
-        next_run_at=${sqlString(now)},
-        last_error=${sqlString(`recovered stale running job after ${runningJobStaleSeconds}s`)},
-        updated_at=${sqlString(now)}
-    WHERE id IN (${rows.map((row) => Number(row.id)).join(",")});
-  `);
+  const ids = rows.map((row) => Number(row.id));
+  const placeholders = ids.map(() => "?").join(",");
+  const errorMsg = `recovered stale running job after ${runningJobStaleSeconds}s`;
+  dbRun(`UPDATE sync_jobs SET status='retry', next_run_at=?, last_error=?, updated_at=? WHERE id IN (${placeholders});`, [now, errorMsg, now, ...ids]);
   lastRecoveredRunningJobs = {
     ok: true,
     recovered: rows.length,
@@ -892,22 +649,19 @@ function scheduleDispatch(delayMs = batchDispatchDelayMs) {
 
 function finishJob(jobId, success, errorMessage = "") {
   const now = new Date().toISOString();
+  const id = Number(jobId);
   if (success) {
-    dbExec(`UPDATE sync_jobs SET status='success', last_error=NULL, updated_at=${sqlString(now)} WHERE id=${Number(jobId)};`);
+    dbRun("UPDATE sync_jobs SET status='success', last_error=NULL, updated_at=? WHERE id=?;", [now, id]);
     return;
   }
-  const rows = dbQuery(`SELECT attempts FROM sync_jobs WHERE id=${Number(jobId)};`);
-  const attempts = Number(rows[0]?.attempts || 0);
+  const row = dbOne("SELECT attempts FROM sync_jobs WHERE id=?;", [id]);
+  const attempts = Number(row?.attempts || 0);
   if (attempts >= maxJobAttempts) {
-    dbExec(`UPDATE sync_jobs SET status='failed', last_error=${sqlString(errorMessage)}, updated_at=${sqlString(now)} WHERE id=${Number(jobId)};`);
+    dbRun("UPDATE sync_jobs SET status='failed', last_error=?, updated_at=? WHERE id=?;", [errorMessage, now, id]);
     return;
   }
   const nextRunAt = new Date(Date.now() + nextRetryDelaySeconds(attempts) * 1000).toISOString();
-  dbExec(`
-    UPDATE sync_jobs
-    SET status='retry', next_run_at=${sqlString(nextRunAt)}, last_error=${sqlString(errorMessage)}, updated_at=${sqlString(now)}
-    WHERE id=${Number(jobId)};
-  `);
+  dbRun("UPDATE sync_jobs SET status='retry', next_run_at=?, last_error=?, updated_at=? WHERE id=?;", [nextRunAt, errorMessage, now, id]);
 }
 
 function shellJqlKeyList(keys) {
@@ -925,14 +679,14 @@ function selectBatchJobs(firstJob, now) {
   if (!batchSyncEnabled || !isBatchableRecordJob(firstJob)) {
     return [firstJob];
   }
-  const rows = dbQuery(`
+  const rows = dbAll(`
     SELECT * FROM sync_jobs
     WHERE status IN ('pending', 'retry')
-      AND next_run_at <= ${sqlString(now)}
-      AND table_id=${sqlString(firstJob.table_id)}
+      AND next_run_at <= ?
+      AND table_id=?
     ORDER BY next_run_at ASC, id ASC
-    LIMIT ${Math.max(1, batchSyncSize * 2)};
-  `);
+    LIMIT ?;
+  `, [now, firstJob.table_id, Math.max(1, batchSyncSize * 2)]);
   const selected = [];
   const seenKeys = new Set();
   for (const row of rows) {
@@ -962,25 +716,21 @@ function enqueueJob(trigger = {}, options = {}) {
   const jiraKey = trigger.jira_key || `manual-${recordId}`;
   const source = trigger.source || "unknown";
 
-  dbExec(`
+  dbRun(`
     INSERT OR IGNORE INTO sync_jobs (
       table_id, record_id, jira_key, source, status, attempts, next_run_at,
       trigger_json, options_json, created_at, updated_at
-    ) VALUES (
-      ${sqlString(tableId)}, ${sqlString(recordId)}, ${sqlString(jiraKey)}, ${sqlString(source)},
-      'pending', 0, ${sqlString(now)}, ${sqlString(JSON.stringify(trigger))}, ${sqlString(JSON.stringify(options))},
-      ${sqlString(now)}, ${sqlString(now)}
-    );
-  `);
-  const row = dbQuery(`
+    ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?);
+  `, [tableId, recordId, jiraKey, source, now, JSON.stringify(trigger), JSON.stringify(options), now, now]);
+  const row = dbOne(`
     SELECT * FROM sync_jobs
-    WHERE table_id=${sqlString(tableId)}
-      AND record_id=${sqlString(recordId)}
-      AND jira_key=${sqlString(jiraKey)}
+    WHERE table_id=?
+      AND record_id=?
+      AND jira_key=?
       AND status IN ('pending', 'running', 'retry')
     ORDER BY id DESC
     LIMIT 1;
-  `)[0];
+  `, [tableId, recordId, jiraKey]);
   scheduleDispatch();
   return row ? { id: `job-${row.id}`, status: row.status, trigger } : { id: `job-skipped-${Date.now()}`, status: "duplicate", trigger };
 }
@@ -1017,7 +767,7 @@ function enqueueExistingRecordsForTable(config, options = {}) {
 
 function enqueueFullRefreshAll(body = {}) {
   const startedAt = new Date();
-  const rebuilt = rebuildIndexFromLark();
+  const rebuilt = doRebuildIndex();
   const configs = loadSyncTableConfigs({ force: true });
   const tables = [];
   for (const config of configs) {
@@ -1085,20 +835,19 @@ function isRunScheduled(recordId, jiraKey, tableId = "") {
     if (recordId && lastRun.trigger.target_record_id === recordId && (!tableId || lastRun.trigger.target_table_id === tableId)) return true;
   }
   try {
-    const rows = dbQuery(`
-      SELECT id FROM sync_jobs
-      WHERE record_id=${sqlString(recordId)}
-        AND (${tableId ? `table_id=${sqlString(tableId)}` : "1=1"})
-        AND status IN ('pending', 'running', 'retry')
-      LIMIT 1;
-    `);
-    return rows.length > 0;
-  } catch {
+    const row = tableId
+      ? dbOne("SELECT id FROM sync_jobs WHERE record_id=? AND table_id=? AND status IN ('pending', 'running', 'retry') LIMIT 1;", [recordId, tableId])
+      : dbOne("SELECT id FROM sync_jobs WHERE record_id=? AND status IN ('pending', 'running', 'retry') LIMIT 1;", [recordId]);
+    return Boolean(row);
+  } catch (error) {
+    console.error("[isRunScheduled] error:", error.message);
     return false;
   }
 }
 
 function handleLarkRecordEvent(eventBody) {
+  // Successfully received event — reset reconnect backoff
+  eventListenerConsecutiveFailures = 0;
   const event = eventBody?.event || eventBody?.data?.event || eventBody;
   if (!event || event.file_token !== process.env.LARK_BASE_TOKEN) {
     return { ok: true, ignored: true, reason: "different base" };
@@ -1170,20 +919,25 @@ function processedKey(tableId, recordId, jiraKey) {
   return `${tableId}:${recordId}:${jiraKey}`;
 }
 
+const PROCESSED_MAX_SIZE = 2000;
+
 function rememberProcessed(tableId, recordId, jiraKey, updatedAt) {
-  processedRecordVersions.set(processedKey(tableId, recordId, jiraKey), updatedAt || Date.now());
-  if (processedRecordVersions.size <= 2000) return;
-  const keepAfter = Date.now() - 24 * 60 * 60 * 1000;
-  for (const [key, value] of processedRecordVersions.entries()) {
-    if (value < keepAfter) processedRecordVersions.delete(key);
+  const key = processedKey(tableId, recordId, jiraKey);
+  // Delete and re-set to move key to end (Map insertion order = LRU order)
+  processedRecordVersions.delete(key);
+  processedRecordVersions.set(key, updatedAt || Date.now());
+  // Evict oldest entries when over capacity
+  if (processedRecordVersions.size > PROCESSED_MAX_SIZE) {
+    const excess = processedRecordVersions.size - PROCESSED_MAX_SIZE;
+    let removed = 0;
+    for (const k of processedRecordVersions.keys()) {
+      if (removed >= excess) break;
+      processedRecordVersions.delete(k);
+      removed += 1;
+    }
   }
 }
 
-function chunkArray(items, size) {
-  const chunks = [];
-  for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
-  return chunks;
-}
 
 async function runIncrementalRefresh(options = {}) {
   if (!incrementalEnabled || incrementalRunning) return;
@@ -1213,7 +967,6 @@ async function runIncrementalRefresh(options = {}) {
       return;
     }
 
-    const rebuilt = rebuildIndexFromLark();
     const keysInLark = indexedJiraKeys();
 
     for (const keys of chunkArray(keysInLark, 80)) {
@@ -1248,7 +1001,6 @@ async function runIncrementalRefresh(options = {}) {
       finished_at: new Date().toISOString(),
       interval_seconds: incrementalIntervalMs / 1000,
       window: incrementalWindow,
-      indexed_record_count: rebuilt.indexed,
       lark_key_count: keysInLark.length,
       queued: queued.length,
       skipped_fresh: skippedFresh.length,
@@ -1333,23 +1085,38 @@ function startEventListener() {
     process.stderr.write(`[lark-event] ${chunk}`);
   });
   eventListener.on("close", (code) => {
+    eventListener = null;
+    if (code === 0) {
+      eventListenerConsecutiveFailures = 0;
+    } else {
+      eventListenerConsecutiveFailures += 1;
+    }
     lastEvent = {
       ...(lastEvent || {}),
       listener_running: false,
       listener_exit_code: code,
       listener_exited_at: new Date().toISOString(),
+      consecutive_failures: eventListenerConsecutiveFailures,
     };
-    eventListener = null;
     if (eventEnabled) {
-      setTimeout(startEventListener, 15000);
+      if (eventListenerConsecutiveFailures >= EVENT_LISTENER_MAX_CONSECUTIVE_FAILURES) {
+        console.error(`[lark-event] stopped reconnecting after ${eventListenerConsecutiveFailures} consecutive failures`);
+        lastEvent.reconnect_stopped = true;
+        return;
+      }
+      const backoffMs = Math.min(15000 * Math.pow(2, eventListenerConsecutiveFailures - 1), EVENT_LISTENER_MAX_BACKOFF_MS);
+      console.error(`[lark-event] reconnecting in ${Math.round(backoffMs / 1000)}s (failure #${eventListenerConsecutiveFailures})`);
+      setTimeout(startEventListener, backoffMs);
     }
   });
   eventListener.on("error", (error) => {
+    eventListenerConsecutiveFailures += 1;
     lastEvent = {
       ok: false,
       listener_running: false,
       error: error.message,
       listener_failed_at: new Date().toISOString(),
+      consecutive_failures: eventListenerConsecutiveFailures,
     };
     eventListener = null;
   });
@@ -1365,22 +1132,17 @@ function startNextRun() {
     return;
   }
   const now = new Date().toISOString();
-  const row = dbQuery(`
-    SELECT * FROM sync_jobs
-    WHERE status IN ('pending', 'retry')
-      AND next_run_at <= ${sqlString(now)}
-    ORDER BY next_run_at ASC, id ASC
-    LIMIT 1;
-  `)[0];
+  const row = dbOne("SELECT * FROM sync_jobs WHERE status IN ('pending', 'retry') AND next_run_at <= ? ORDER BY next_run_at ASC, id ASC LIMIT 1;", [now]);
   if (!row) return;
   const job = jobFromRow(row);
   const jobs = selectBatchJobs(job, now);
   const jobIds = jobs.map((item) => Number(item.id));
-  dbExec(`
+  const placeholders = jobIds.map(() => "?").join(",");
+  dbRun(`
     UPDATE sync_jobs
-    SET status='running', attempts=attempts+1, updated_at=${sqlString(now)}
-    WHERE id IN (${jobIds.join(",")});
-  `);
+    SET status='running', attempts=attempts+1, updated_at=?
+    WHERE id IN (${placeholders});
+  `, [now, ...jobIds]);
   if (jobs.length === 1) {
     runSync(job.trigger, { ...job.options, jobId: job.id });
     return;
@@ -1442,10 +1204,9 @@ const server = createServer(async (req, res) => {
         jira_reachability: lastJiraReachability,
       },
       cache: {
-        path: cachePath,
         db_path: dbPath,
-        records: Object.keys(syncCache.records || {}).length,
-        jira_keys: Object.keys(syncCache.jira_to_records || {}).length,
+        records: indexRecordCount(),
+        jira_keys: indexJiraKeyCount(),
       },
       config: {
         runtime: publicConfigSummary(config),
@@ -1548,7 +1309,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname === "/api/rebuild-index") {
-      const result = rebuildIndexFromLark();
+      const result = doRebuildIndex();
       sendJson(res, 200, result);
       return;
     }
@@ -1594,7 +1355,7 @@ const server = createServer(async (req, res) => {
 
     if (url.pathname === "/api/sync-jira-to-lark") {
       if (!body.jql && !body.jira_jql) {
-        const rebuilt = rebuildIndexFromLark();
+        const rebuilt = doRebuildIndex();
         const configs = body.table_id
           ? loadSyncTableConfigs({ force: true }).filter((config) => config.id === body.table_id)
           : loadSyncTableConfigs({ force: true });
@@ -1646,7 +1407,7 @@ const server = createServer(async (req, res) => {
 });
 
 initDb();
-importJsonCacheToDb();
+migrateJsonCacheToDb(cachePath);
 
 server.listen(port, "0.0.0.0", () => {
   console.log(`sync server listening on http://127.0.0.1:${port}`);

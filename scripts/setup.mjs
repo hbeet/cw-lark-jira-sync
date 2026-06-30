@@ -46,12 +46,13 @@ if (nodeVersion < 22) {
 }
 success(`Node.js ${process.version}`);
 
-// ─── Step 2: lark-cli ────────────────────────────────────────
+// ─── Step 2: lark-cli 安装 ───────────────────────────────────
 step(2, "检查 lark-cli");
 if (!commandExists("lark-cli")) {
   console.log("未检测到 lark-cli。请先安装：");
+  console.log("");
   console.log("  下载地址: https://github.com/anthropics/lark-cli/releases");
-  console.log("  安装后确保 lark-cli 在 PATH 中");
+  console.log("  下载后将 lark-cli 移入 PATH 目录（如 ~/.local/bin/）");
   console.log("");
   await waitForEnter("安装完成后按回车继续...");
   if (!commandExists("lark-cli")) {
@@ -61,18 +62,53 @@ if (!commandExists("lark-cli")) {
 const larkVersion = runCapture("lark-cli", ["--version"]);
 success(`lark-cli ${larkVersion.stdout.trim()}`);
 
-// ─── Step 3: lark-cli 登录 ──────────────────────────────────
-step(3, "lark-cli 登录");
+// ─── Step 3: 创建飞书应用 + 权限 + 事件 + 登录 ─────────────
+step(3, "配置飞书应用并登录 lark-cli");
+
 const whoami = runCapture("lark-cli", ["base", "+table-list", "--as", "user", "--base-token", "test", "--format", "json"], { timeout: 15000 });
 const isLoggedIn = whoami.ok || !/(login|authen|unauthorized)/i.test(whoami.stderr + whoami.stdout);
+
+let appId = "";
+let eventEnabled = false;
+
 if (!isLoggedIn) {
-  console.log("需要登录 lark-cli，将打开浏览器进行扫码授权...");
+  console.log("lark-cli 需要关联一个飞书开放平台应用。请按以下步骤操作：\n");
+  console.log("  1. 打开飞书开放平台，创建「企业自建应用」");
+  console.log("     https://open.larksuite.com/app\n");
+  console.log("  2. 进入应用 → 权限管理 → 添加以下权限：");
+  console.log("     • 应用身份权限: 查看、评论、编辑和管理云空间中所有文件");
+  console.log("     • 用户身份权限: 查看、评论、编辑和管理云空间中所有文件\n");
+  console.log("  3. 进入应用 → 事件订阅 → 添加事件：");
+  console.log("     • 多维表格记录变更（bitable.record.changed）\n");
+  console.log("  4. 在「凭证与基础信息」页面复制 App ID\n");
+  console.log("  5. 创建应用版本并发布（审核通过后生效）\n");
+
+  openUrl("https://open.larksuite.com/app");
+  await waitForEnter("以上步骤完成后，按回车继续...");
+
+  console.log("\n正在启动 lark-cli 登录（浏览器将弹出扫码页面）...\n");
   const login = spawnSync("lark-cli", ["login"], { stdio: "inherit", timeout: 120000 });
   if (login.status !== 0) {
     fail("lark-cli 登录失败");
   }
 }
 success("lark-cli 已登录");
+
+// 自动获取 App ID
+const configShow = runCapture("lark-cli", ["config", "show"], { timeout: 5000 });
+if (configShow.ok) {
+  try {
+    const config = JSON.parse(configShow.stdout);
+    if (config.appId) {
+      appId = config.appId;
+      eventEnabled = true;
+      success(`App ID: ${appId}（已自动获取）`);
+    }
+  } catch {}
+}
+if (!appId) {
+  console.log("未能自动获取 App ID，事件监听将不启用（同步依赖定时增量刷新）");
+}
 
 // ─── Step 4: Jira 配置 ──────────────────────────────────────
 step(4, "配置 Jira");
@@ -148,31 +184,24 @@ const larkCheck = runCapture("lark-cli", ["base", "+table-list", "--as", "user",
 if (larkCheck.ok) {
   success("Lark Base 可访问");
 } else {
-  console.log("⚠️ 访问失败（可能需要先被邀请到该 Base），继续配置...");
+  console.log("⚠️ 访问失败，可能原因：");
+  console.log("   • 应用权限尚未审核通过（检查飞书开放平台 → 应用发布状态）");
+  console.log("   • 你没有该 Base 的访问权限（请让管理员邀请你）");
+  console.log("   继续配置，后续可重试...");
 }
 
-// ─── Step 6: 事件监听 ───────────────────────────────────────
-step(6, "事件监听（实时推送）");
-let eventEnabled = false;
-let appId = "";
-if (await confirm(rl, "是否启用 Lark 事件实时推送？", true)) {
-  console.log("\n需要一个飞书开放平台应用的 App ID。");
-  console.log("请在飞书开放平台 → 企业自建应用 → 勾选 Base 事件权限 → 发布。\n");
-  appId = await ask(rl, "App ID");
-  if (appId) {
-    eventEnabled = true;
-    console.log("正在创建 Python 环境...");
-    const venvPath = `${runtimeDir}/.venv-lark-sdk`;
-    if (!existsSync(`${venvPath}/bin/python`)) {
-      spawnSync("python3", ["-m", "venv", venvPath], { stdio: "inherit" });
-      spawnSync(`${venvPath}/bin/python`, ["-m", "pip", "install", "--upgrade", "pip", "lark-oapi"], { stdio: "inherit" });
-    }
-    success("事件监听环境就绪");
-  } else {
-    console.log("跳过事件监听配置");
+// ─── Step 6: 事件监听环境 ────────────────────────────────────
+step(6, "事件监听环境");
+if (eventEnabled && appId) {
+  console.log("正在创建 Python 环境（用于接收飞书事件推送）...");
+  const venvPath = `${runtimeDir}/.venv-lark-sdk`;
+  if (!existsSync(`${venvPath}/bin/python`)) {
+    spawnSync("python3", ["-m", "venv", venvPath], { stdio: "inherit" });
+    spawnSync(`${venvPath}/bin/python`, ["-m", "pip", "install", "--upgrade", "pip", "lark-oapi"], { stdio: "inherit" });
   }
+  success("事件监听环境就绪");
 } else {
-  console.log("跳过事件监听");
+  console.log("未配置事件监听，跳过（同步将依赖定时增量刷新）");
 }
 
 // ─── Step 7: 写入配置 ───────────────────────────────────────

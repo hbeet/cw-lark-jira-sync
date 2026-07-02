@@ -27,6 +27,7 @@ const {
   logsDir,
   syncConfigCacheSeconds,
 } = config;
+const baseTokens = config.baseTokens;
 const cachePath = config.cache.path;
 const dbPath = config.cache.dbPath;
 const eventEnabled = config.event.enabled;
@@ -246,7 +247,10 @@ function parseLarkEventFieldValue(value) {
 function getTableFieldId(tableId, fieldName) {
   const cacheKey = `${tableId}:${fieldName}`;
   if (fieldCache.has(cacheKey)) return fieldCache.get(cacheKey);
-  if (!process.env.LARK_BASE_TOKEN || !tableId) return "";
+  if (!tableId) return "";
+  const tc = getSyncTableConfig(tableId);
+  const baseToken = tc?.baseToken || baseTokens[0] || "";
+  if (!baseToken) return "";
 
   const result = larkCliSync( [
     "base",
@@ -254,7 +258,7 @@ function getTableFieldId(tableId, fieldName) {
     "--as",
     process.env.LARK_AS || "user",
     "--base-token",
-    process.env.LARK_BASE_TOKEN,
+    baseToken,
     "--table-id",
     tableId,
     "--format",
@@ -284,6 +288,7 @@ function discoverSyncTableConfigs() {
     cwd: __dirname,
     excluded: excludedTableIds(),
     fieldCache,
+    baseTokens,
   });
 }
 
@@ -357,7 +362,7 @@ async function checkJiraReachable() {
 }
 
 function checkLarkReachable() {
-  return checkLarkReachableApi({ env: process.env, cwd: __dirname, timeout: 15000 });
+  return checkLarkReachableApi({ env: process.env, cwd: __dirname, timeout: 15000, baseTokens });
 }
 
 function delay(ms) {
@@ -419,15 +424,18 @@ function scheduleIncrementalRetry(reason = "jira_unreachable") {
 }
 
 function tableEnv(tableId) {
-  const config = getSyncTableConfig(tableId);
-  return tableId ? { LARK_TABLE_ID: tableId, ...envForTableConfig(config || {}) } : {};
+  const tc = getSyncTableConfig(tableId);
+  if (!tableId) return {};
+  return {
+    LARK_TABLE_ID: tableId,
+    ...(tc?.baseToken ? { LARK_BASE_TOKEN: tc.baseToken } : {}),
+    ...envForTableConfig(tc || {}),
+  };
 }
 
 function runSync(trigger = {}, options = {}) {
   requireEnv("JIRA_BASE_URL");
   requireEnv("JIRA_TOKEN");
-  requireEnv("LARK_BASE_TOKEN");
-  requireEnv("LARK_TABLE_ID");
   if (!options.jiraJql) {
     requireEnv("JIRA_JQL");
   }
@@ -857,7 +865,8 @@ function handleLarkRecordEvent(eventBody) {
   // Successfully received event — reset reconnect backoff
   eventListenerConsecutiveFailures = 0;
   const event = eventBody?.event || eventBody?.data?.event || eventBody;
-  if (!event || event.file_token !== process.env.LARK_BASE_TOKEN) {
+  const knownBases = new Set(baseTokens);
+  if (!event || !knownBases.has(event.file_token)) {
     return { ok: true, ignored: true, reason: "different base" };
   }
 
